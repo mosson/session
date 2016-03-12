@@ -3,25 +3,24 @@ package session
 import (
 	"crypto/sha1"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
-	"strconv"
+	"os"
 	"time"
 
 	"gopkg.in/redis.v3"
 )
 
 var (
-	staticClient    *redis.Client
+	staticRegistry  registry
 	staticCookieKey string
-	staticNamespace string
 )
 
-// Handlee is net/http.Handler and can set session object
+// Handlee is net/http.Handler and can handle session
 type Handlee interface {
-	SetSession(*Session)
+	GetSession([]byte)
+	SetSession() []byte
 	ServeHTTP(http.ResponseWriter, *http.Request)
 }
 
@@ -30,69 +29,53 @@ type Handler struct {
 	Next Handlee
 }
 
-// Session is struct of sessoin data
-type Session struct {
-	Name string `json:"name"`
+// Sugar returns net/http handler wrapping session handler
+func Sugar(handlee Handlee) *Handler {
+	return &Handler{Next: handlee}
 }
 
 // Setup sets up redis store for session kvs.
-func Setup(cookieKey string, namespace string, options *redis.Options) {
-	if staticClient != nil {
+func Setup(cookieKey string, namespace string, dialect int, options *redis.Options) {
+	if staticRegistry != nil {
 		return
 	}
 
 	staticCookieKey = cookieKey
-	staticNamespace = namespace
-
-	newClient := redis.NewClient(options)
-	_, err := newClient.Ping().Result()
-	if err != nil {
-		panic(err)
-	}
-	staticClient = newClient
+	staticRegistry = newRegistry(namespace, dialect, options)
 }
 
 // Dispose closes redis.Client
-func Dispose() {
-	if staticClient != nil {
-		return
+func Dispose() error {
+	if staticRegistry != nil {
+		return nil
 	}
 
-	err := staticClient.Close()
-
-	if err != nil {
-		panic(err)
-	}
+	return staticRegistry.dispose()
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	sessionID := GetSessionID(r)
-
-	log.Printf("セッションID: %s", sessionID)
-
-	val, err := staticClient.Get(fmt.Sprintf("%s:%s", staticNamespace, sessionID)).Result()
-	var session *Session
-	if err == redis.Nil {
-		log.Printf("セッションは空でした。新規作成します。\n")
-		session = &Session{}
-		writeCookie(w, sessionID)
-	} else if err != nil {
-		panic(err)
-	} else {
-		log.Printf("セッションを取得しました。 %v", val)
-		session = GetSession(val)
-	}
-
-	defer writeSession(sessionID, session)
-
 	if h.Next == nil {
 		return
 	}
-	h.Next.SetSession(session)
+
+	sessionID := getSessionID(r)
+	setSessionID(w, sessionID)
+	session, err := staticRegistry.get(sessionID)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	h.Next.GetSession(session)
+
 	h.Next.ServeHTTP(w, r)
+
+	err = staticRegistry.set(sessionID, h.Next.SetSession(), 0)
+	if err != nil {
+		log.Fatal(err)
+	}
 }
 
-func writeCookie(w http.ResponseWriter, sessionID string) {
+func setSessionID(w http.ResponseWriter, sessionID string) {
 	cookie := http.Cookie{
 		Name:    staticCookieKey,
 		Value:   sessionID,
@@ -102,41 +85,13 @@ func writeCookie(w http.ResponseWriter, sessionID string) {
 	http.SetCookie(w, &cookie)
 }
 
-func writeSession(sessionID string, session *Session) {
-	data, err := json.Marshal(session)
-
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	staticClient.Set(
-		fmt.Sprintf("%s:%s", staticNamespace, sessionID),
-		data,
-		0,
-	)
-}
-
-// GetSession returns Session struct made from json data
-func GetSession(data string) *Session {
-	var session Session
-	err := json.Unmarshal([]byte(data), &session)
-
-	if err != nil {
-		log.Println(err)
-		return &Session{}
-	}
-
-	return &session
-}
-
-// GetSessionID returns random ID that stored in cookie or generated
-func GetSessionID(r *http.Request) string {
+// getSessionID returns random ID that stored in cookie or generated
+func getSessionID(r *http.Request) string {
 	cookie, err := r.Cookie(staticCookieKey)
 	var sessionID string
 	if cookie == nil || err != nil {
 		cryptor := sha1.New()
-		key := strconv.Itoa(int(time.Now().UnixNano()))
+		key := fmt.Sprintf("%d:%d", time.Now().UnixNano(), os.Getpid())
 		cryptor.Write([]byte(key))
 		sessionID = hex.EncodeToString(cryptor.Sum(nil))
 	} else {
