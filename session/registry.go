@@ -24,7 +24,9 @@ type registry interface {
 type memoryRegistry struct {
 	memory    map[string][]byte
 	namespace string
-	lock      *sync.RWMutex
+	// map is not thread safe
+	// https://golang.org/doc/faq#atomic_maps
+	lock *sync.RWMutex
 }
 
 type redisRegistry struct {
